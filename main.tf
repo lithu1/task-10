@@ -3,11 +3,6 @@ resource "random_id" "suffix" {
   byte_length = 4
 }
 
-# ECS Cluster
-resource "aws_ecs_cluster" "strapi" {
-  name = "${var.app_name}-${random_id.suffix.hex}-cluster"
-}
-
 # Get default VPC and subnets
 data "aws_vpc" "default" {
   default = true
@@ -18,6 +13,16 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+}
+
+# Extract two subnets from different AZs to avoid ALB subnet conflict
+locals {
+  alb_subnets = slice(data.aws_subnets.default.ids, 0, 2)
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "strapi" {
+  name = "${var.app_name}-${random_id.suffix.hex}-cluster"
 }
 
 # Security Group for ALB
@@ -73,7 +78,7 @@ resource "aws_security_group" "ecs_sg" {
 resource "aws_lb" "this" {
   name               = "${var.app_name}-${random_id.suffix.hex}-alb"
   load_balancer_type = "application"
-  subnets            = data.aws_subnets.default.ids
+  subnets            = local.alb_subnets
   security_groups    = [aws_security_group.alb_sg.id]
 }
 
@@ -191,6 +196,8 @@ resource "aws_ecs_service" "strapi" {
   lifecycle {
     ignore_changes = [task_definition]
   }
+
+  depends_on = [aws_ecs_task_definition.strapi_task]
 }
 
 # IAM Role for CodeDeploy
@@ -199,7 +206,7 @@ resource "aws_iam_role" "codedeploy_role" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [ {
+    Statement = [{
       Effect = "Allow"
       Principal = {
         Service = "codedeploy.amazonaws.com"
@@ -249,8 +256,8 @@ resource "aws_codedeploy_deployment_group" "ecs" {
 
   blue_green_deployment_config {
     terminate_blue_instances_on_deployment_success {
-      action                              = "TERMINATE"
-      termination_wait_time_in_minutes   = 5
+      action                            = "TERMINATE"
+      termination_wait_time_in_minutes = 5
     }
 
     deployment_ready_option {
