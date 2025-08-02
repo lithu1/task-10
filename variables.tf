@@ -1,49 +1,33 @@
 variable "aws_region" {
-  description = "AWS region to deploy to"
+  default = "us-east-2"
+}
+
+variable "vpc_id" {
+  description = "VPC ID for networking"
   type        = string
-  default     = "us-east-2"
 }
 
-variable "ecs_cluster_name" {
-  default = "strapi-cluster"
+variable "public_subnets" {
+  description = "List of public subnet IDs"
+  type        = list(string)
 }
 
-variable "ecs_task_cpu" {
-  default = "512"
+variable "private_subnets" {
+  description = "List of private subnet IDs"
+  type        = list(string)
 }
 
-variable "ecs_task_memory" {
-  default = "1024"
+variable "image_uri" {
+  description = "Container image URI"
+  type        = string
 }
 
-variable "strapi_container_port" {
-  default = 1337
+variable "ecs_task_execution_role_arn" {
+  description = "ARN of ECS task execution IAM role"
+  type        = string
 }
 
-variable "strapi_image" {
-  default = "607700977843.dkr.ecr.us-east-2.amazonaws.com/strapi-ecr-prod:latest"
-}
-
-variable "alb_name" {
-  default = "strapi-alb"
-}
-
-variable "blue_target_group_name" {
-  default = "strapi-blue"
-}
-
-variable "green_target_group_name" {
-  default = "strapi-green"
-}
-
-variable "deployment_group_name" {
-  default = "StrapiDeploymentGroup"
-}
-
-variable "codedeploy_app_name" {
-  default = "StrapiApp"
-}
-
-variable "ecs_service_name" {
-  default = "strapi-service"
+variable "codedeploy_role_arn" {
+  description = "IAM role ARN for CodeDeploy"
+  type        = string
 }
