@@ -1,15 +1,28 @@
 variable "region" {
-  default = "us-east-2"
+  description = "AWS region"
+  type        = string
+  default     = "us-east-2"
 }
 
-variable "app_name" {
-  default = "strapi-app"
+variable "image_url" {
+  description = "Full Docker image URL for ECS task"
+  type        = string
 }
 
 variable "container_port" {
-  default = 1337
+  description = "Port exposed by the container"
+  type        = number
+  default     = 1337
 }
-variable "image_url" {
-  description = "Docker image URL for the ECS task definition"
+
+variable "app_name" {
+  description = "Name prefix for all AWS resources"
   type        = string
+  default     = "strapi-app"
+}
+
+variable "desired_count" {
+  description = "Number of ECS tasks to run"
+  type        = number
+  default     = 1
 }
