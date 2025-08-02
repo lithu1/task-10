@@ -176,6 +176,7 @@ resource "aws_ecs_service" "strapi" {
   name            = "${var.app_name}-${random_id.suffix.hex}-svc"
   cluster         = aws_ecs_cluster.strapi.id
   launch_type     = "FARGATE"
+  task_definition = aws_ecs_task_definition.strapi_task.arn
   desired_count   = 1
   deployment_controller {
     type = "CODE_DEPLOY"
