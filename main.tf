@@ -1,51 +1,66 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.0"
-    }
-  }
-  required_version = ">= 1.3.0"
-}
+// main.tf
 
-provider "aws" {
-  region = "us-east-2"
-}
-
-variable "ecs_service_name" {
-  description = "Name of the ECS service to register with CodeDeploy"
-  type        = string
-}
-
-resource "random_id" "suffix" {
-  byte_length = 4
-}
-
+// ----------------------
+// DATA SOURCES
+// ----------------------
 data "aws_vpc" "default" {
   default = true
 }
 
-data "aws_subnets" "default" {
+data "aws_subnets" "public" {
   filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
+    name   = "default-for-az"
+    values = ["true"]
   }
 }
 
-locals {
-  name       = "strapi-app-${random_id.suffix.hex}"
-  vpc_id     = data.aws_vpc.default.id
-  subnet_ids = data.aws_subnets.default.ids
+// ----------------------
+// ECS CLUSTER
+// ----------------------
+resource "aws_ecs_cluster" "strapi" {
+  name = var.ecs_cluster_name
 }
 
-# Security Group for ALB
+// ----------------------
+// IAM ROLES
+// ----------------------
+data "aws_iam_policy_document" "ecs_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_task_execution" {
+  name               = "ecsTaskExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_exec_policy" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+// ----------------------
+// SECURITY GROUPS
+// ----------------------
 resource "aws_security_group" "alb_sg" {
-  name_prefix = "alb-sg-"
-  vpc_id      = local.vpc_id
+  name   = "strapi-alb-sg"
+  vpc_id = data.aws_vpc.default.id
 
   ingress {
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -58,14 +73,13 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
-# Security Group for ECS
 resource "aws_security_group" "ecs_sg" {
-  name_prefix = "ecs-sg-"
-  vpc_id      = local.vpc_id
+  name   = "strapi-ecs-sg"
+  vpc_id = data.aws_vpc.default.id
 
   ingress {
-    from_port       = 1337
-    to_port         = 1337
+    from_port       = var.strapi_container_port
+    to_port         = var.strapi_container_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
   }
@@ -78,143 +92,149 @@ resource "aws_security_group" "ecs_sg" {
   }
 }
 
-# Application Load Balancer
-resource "aws_lb" "this" {
-  name               = "alb-${random_id.suffix.hex}"
+// ----------------------
+// APPLICATION LOAD BALANCER
+// ----------------------
+resource "aws_lb" "strapi_alb" {
+  name               = var.alb_name
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = local.subnet_ids
-
-  enable_deletion_protection = false
-
-  tags = {
-    Name = local.name
-  }
+  subnets            = data.aws_subnets.public.ids
 }
 
-# Target Groups
 resource "aws_lb_target_group" "blue" {
-  name        = "blue-tg-${random_id.suffix.hex}"
-  port        = 1337
+  name        = var.blue_target_group_name
+  port        = var.strapi_container_port
   protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
   target_type = "ip"
-  vpc_id      = local.vpc_id
-
   health_check {
-    path                = "/"
-    interval            = 30
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    matcher             = "200"
+    path = "/"
+    port = tostring(var.strapi_container_port)
   }
 }
 
 resource "aws_lb_target_group" "green" {
-  name        = "green-tg-${random_id.suffix.hex}"
-  port        = 1337
+  name        = var.green_target_group_name
+  port        = var.strapi_container_port
   protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
   target_type = "ip"
-  vpc_id      = local.vpc_id
-
   health_check {
-    path                = "/"
-    interval            = 30
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    matcher             = "200"
+    path = "/"
+    port = tostring(var.strapi_container_port)
   }
 }
 
-# Listener
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 80
+  load_balancer_arn = aws_lb.strapi_alb.arn
+  port              = "80"
   protocol          = "HTTP"
-
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.blue.arn
   }
 }
 
-# ECS Cluster
-resource "aws_ecs_cluster" "this" {
-  name = "strapi-cluster-${random_id.suffix.hex}"
+// ----------------------
+// ECS TASK DEFINITION
+// ----------------------
+resource "aws_ecs_task_definition" "strapi" {
+  family                   = "strapi-task"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  cpu                      = var.ecs_task_cpu
+  memory                   = var.ecs_task_memory
+  container_definitions = jsonencode([{
+    name      = "strapi"
+    image     = var.strapi_image
+    portMappings = [{ containerPort = var.strapi_container_port, protocol = "tcp" }]
+  }])
 }
 
-# IAM Role for CodeDeploy
-resource "aws_iam_role" "codedeploy_role" {
-  name = "codedeploy-role-${random_id.suffix.hex}"
+// ----------------------
+// ECS SERVICE WITH CODEDEPLOY
+// ----------------------
+resource "aws_ecs_service" "strapi" {
+  name            = var.ecs_service_name
+  cluster         = aws_ecs_cluster.strapi.id
+  task_definition = aws_ecs_task_definition.strapi.arn
+  launch_type     = "FARGATE"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [{
-      Effect    = "Allow",
-      Principal = { Service = "codedeploy.amazonaws.com" },
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  deployment_controller {
+    type = "CODE_DEPLOY"
+  }
+
+  network_configuration {
+    subnets         = data.aws_subnets.public.ids
+    assign_public_ip = true
+    security_groups = [aws_security_group.ecs_sg.id]
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.blue.arn
+    container_name   = "strapi"
+    container_port   = var.strapi_container_port
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
-  role       = aws_iam_role.codedeploy_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
-}
-
-# CodeDeploy App
-resource "aws_codedeploy_app" "ecs" {
-  name             = "${local.name}-cd"
+// ----------------------
+// CODEDEPLOY CONFIGURATION
+// ----------------------
+resource "aws_codedeploy_app" "strapi" {
+  name             = var.codedeploy_app_name
   compute_platform = "ECS"
 }
 
-# CodeDeploy Deployment Group
-resource "aws_codedeploy_deployment_group" "ecs_dg" {
-  app_name               = aws_codedeploy_app.ecs.name
-  deployment_group_name  = "${local.name}-cd-dg"
-  service_role_arn       = aws_iam_role.codedeploy_role.arn
-  deployment_config_name = "CodeDeployDefault.ECSAllAtOnce"
+resource "aws_codedeploy_deployment_group" "strapi" {
+  app_name              = aws_codedeploy_app.strapi.name
+  deployment_group_name = var.deployment_group_name
+  service_role_arn      = aws_iam_role.codedeploy_service.arn
+
+  deployment_style {
+    deployment_type   = "BLUE_GREEN"
+    deployment_option = "WITH_TRAFFIC_CONTROL"
+  }
+
+  blue_green_deployment_config {
+    terminate_blue_instances_on_deployment_success {
+      action = "TERMINATE"
+      termination_wait_time_in_minutes = 5
+    }
+
+    deployment_ready_option {
+      action_on_timeout = "CONTINUE_DEPLOYMENT"
+    }
+
+    green_fleet_provisioning_option {
+      action = "DISCOVER_EXISTING"
+    }
+  }
+
+  ecs_service {
+    cluster_name = aws_ecs_cluster.strapi.name
+    service_name = aws_ecs_service.strapi.name
+  }
 
   auto_rollback_configuration {
     enabled = true
     events  = ["DEPLOYMENT_FAILURE"]
   }
 
-  blue_green_deployment_config {
-    deployment_ready_option {
-      action_on_timeout = "CONTINUE_DEPLOYMENT"
-    }
-
-    terminate_blue_instances_on_deployment_success {
-      action                         = "TERMINATE"
-      termination_wait_time_in_minutes = 5
-    }
-  }
-
-  deployment_style {
-    deployment_option = "WITH_TRAFFIC_CONTROL"
-    deployment_type   = "BLUE_GREEN"
-  }
-
-  ecs_service {
-    cluster_name = aws_ecs_cluster.this.name
-    service_name = var.ecs_service_name
-  }
-
   load_balancer_info {
     target_group_pair_info {
-      prod_traffic_route {
-        listener_arns = [aws_lb_listener.http.arn]
-      }
-
       target_group {
         name = aws_lb_target_group.blue.name
       }
 
       target_group {
         name = aws_lb_target_group.green.name
+      }
+
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.http.arn]
       }
     }
   }
