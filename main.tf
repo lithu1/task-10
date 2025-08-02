@@ -22,7 +22,6 @@ data "aws_subnets" "all" {
   }
 }
 
-# Select one subnet per AZ (up to 2 here)
 data "aws_subnet" "selected" {
   count = 2
   id    = tolist(data.aws_subnets.all.ids)[count.index]
@@ -77,7 +76,7 @@ resource "aws_security_group" "ecs_sg" {
   }
 }
 
-# Load Balancer
+# ALB
 resource "aws_lb" "this" {
   name               = "alb-${random_id.suffix.hex}"
   internal           = false
@@ -86,7 +85,7 @@ resource "aws_lb" "this" {
   subnets            = [for s in data.aws_subnet.selected : s.id]
 }
 
-# Target Groups: Blue & Green
+# Target Groups
 resource "aws_lb_target_group" "blue" {
   name        = "tg-blue-${random_id.suffix.hex}"
   port        = 1337
@@ -119,7 +118,7 @@ resource "aws_lb_target_group" "green" {
   }
 }
 
-# Listener
+# ALB Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.this.arn
   port              = 80
@@ -136,7 +135,7 @@ resource "aws_ecs_cluster" "this" {
   name = "${local.app_name}-cluster"
 }
 
-# Task Definition (placeholder)
+# ECS Task Definition
 resource "aws_ecs_task_definition" "strapi" {
   family                   = "${local.app_name}-task"
   requires_compatibilities = ["FARGATE"]
@@ -161,7 +160,7 @@ resource "aws_ecs_task_definition" "strapi" {
   ])
 }
 
-# ECS Service with CodeDeploy controller
+# ECS Service (CODE_DEPLOY)
 resource "aws_ecs_service" "strapi" {
   name            = "${local.app_name}-svc"
   cluster         = aws_ecs_cluster.this.id
@@ -188,6 +187,29 @@ resource "aws_ecs_service" "strapi" {
   depends_on = [aws_lb_listener.http]
 }
 
+# ✅ IAM Role for CodeDeploy (fixes InvalidRoleException)
+resource "aws_iam_role" "codedeploy_role" {
+  name = "CodeDeployECSRole-${random_id.suffix.hex}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "codedeploy.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codedeploy_policy" {
+  role       = aws_iam_role.codedeploy_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
+}
+
 # CodeDeploy Application
 resource "aws_codedeploy_app" "ecs_app" {
   name             = "${local.app_name}-cd-app"
@@ -198,7 +220,7 @@ resource "aws_codedeploy_app" "ecs_app" {
 resource "aws_codedeploy_deployment_group" "ecs_dg" {
   app_name              = aws_codedeploy_app.ecs_app.name
   deployment_group_name = "${local.app_name}-cd-dg"
-  service_role_arn      = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+  service_role_arn      = aws_iam_role.codedeploy_role.arn
 
   deployment_style {
     deployment_type   = "BLUE_GREEN"
@@ -247,6 +269,13 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
     }
   }
 
-  depends_on = [aws_ecs_service.strapi]
+  depends_on = [
+    aws_ecs_service.strapi,
+    aws_iam_role_policy_attachment.codedeploy_policy
+  ]
 }
 
+# Output
+output "alb_dns" {
+  value = aws_lb.this.dns_name
+}
