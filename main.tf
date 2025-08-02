@@ -1,138 +1,18 @@
-# main.tf
-
 provider "aws" {
-  region = var.region
+  region = "us-east-2"
 }
 
-# Use pre-existing ECS task execution role
-data "aws_iam_role" "ecs_task_execution" {
-  name = "ecs-task-execution-role"
+resource "random_id" "suffix" {
+  byte_length = 4
 }
 
-resource "aws_ecs_cluster" "strapi" {
-  name = "${var.app_name}-cluster"
+locals {
+  app_name     = "strapi-app-${random_id.suffix.hex}"
+  alb_name     = "alb-${random_id.suffix.hex}"
+  vpc_id       = data.aws_vpc.default.id
+  subnet_ids   = data.aws_subnets.default.ids
 }
 
-# Use pre-existing security group
-data "aws_security_group" "lb" {
-  filter {
-    name   = "group-name"
-    values = ["strapi-alb-sg"]
-  }
-  vpc_id = data.aws_vpc.default.id
-}
-
-# ALB
-resource "aws_lb" "this" {
-  name               = "${var.app_name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [data.aws_security_group.lb.id]
-  subnets            = data.aws_subnets.default.ids
-}
-
-# Use pre-existing Target Group
-data "aws_lb_target_group" "strapi" {
-  name = "strapi-tg"
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 80
-  protocol          = "HTTP"
-  default_action {
-    type             = "forward"
-    target_group_arn = data.aws_lb_target_group.strapi.arn
-  }
-}
-
-resource "aws_ecs_task_definition" "strapi" {
-  family                   = "${var.app_name}-task"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "512"
-  memory                   = "1024"
-  network_mode             = "awsvpc"
-  execution_role_arn       = data.aws_iam_role.ecs_task_execution.arn
-  container_definitions = jsonencode([
-    {
-      name      = "${var.app_name}"
-      image     = var.image_url
-      portMappings = [
-        {
-          containerPort = var.container_port
-          protocol       = "tcp"
-        }
-      ]
-      essential = true
-    }
-  ])
-}
-
-resource "aws_ecs_service" "strapi" {
-  name            = "${var.app_name}-service"
-  cluster         = aws_ecs_cluster.strapi.id
-  task_definition = aws_ecs_task_definition.strapi.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    subnets         = data.aws_subnets.default.ids
-    security_groups = [data.aws_security_group.lb.id]
-    assign_public_ip = true
-  }
-
-  deployment_controller {
-    type = "CODE_DEPLOY"
-  }
-
-  load_balancer {
-    target_group_arn = data.aws_lb_target_group.strapi.arn
-    container_name   = var.app_name
-    container_port   = var.container_port
-  }
-
-  depends_on = [aws_lb_listener.http]
-}
-
-# Use existing CodeDeploy application
-data "aws_codedeploy_app" "ecs" {
-  name = "strapi-codedeploy-app"
-}
-
-resource "aws_codedeploy_deployment_group" "ecs" {
-  app_name               = data.aws_codedeploy_app.ecs.name
-  deployment_group_name = "${var.app_name}-deploy-group"
-  service_role_arn       = data.aws_iam_role.ecs_task_execution.arn
-
-  deployment_style {
-    deployment_option = "WITH_TRAFFIC_CONTROL"
-    deployment_type   = "BLUE_GREEN"
-  }
-
-  blue_green_deployment_config {
-    terminate_blue_instances_on_deployment_success {
-      action = "TERMINATE"
-      termination_wait_time_in_minutes = 5
-    }
-
-    deployment_ready_option {
-      action_on_timeout = "CONTINUE_DEPLOYMENT"
-      wait_time_in_minutes = 0
-    }
-  }
-
-  ecs_service {
-    cluster_name = aws_ecs_cluster.strapi.name
-    service_name = aws_ecs_service.strapi.name
-  }
-
-  auto_rollback_configuration {
-    enabled = true
-    events  = ["DEPLOYMENT_FAILURE"]
-  }
-}
-
-# Data Sources for default VPC and Subnets
 data "aws_vpc" "default" {
   default = true
 }
@@ -142,4 +22,223 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+}
+
+# ALB Security Group
+resource "aws_security_group" "alb_sg" {
+  name        = "alb-sg-${random_id.suffix.hex}"
+  description = "Allow HTTP/HTTPS"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ECS Security Group (allow from ALB only)
+resource "aws_security_group" "ecs_sg" {
+  name        = "ecs-sg-${random_id.suffix.hex}"
+  description = "Allow traffic from ALB on port 1337"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    from_port       = 1337
+    to_port         = 1337
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ALB
+resource "aws_lb" "this" {
+  name               = local.alb_name
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = local.subnet_ids
+}
+
+# Target Groups: Blue & Green
+resource "aws_lb_target_group" "blue" {
+  name     = "tg-blue-${random_id.suffix.hex}"
+  port     = 1337
+  protocol = "HTTP"
+  vpc_id   = local.vpc_id
+  target_type = "ip"
+  health_check {
+    path                = "/"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_target_group" "green" {
+  name     = "tg-green-${random_id.suffix.hex}"
+  port     = 1337
+  protocol = "HTTP"
+  vpc_id   = local.vpc_id
+  target_type = "ip"
+  health_check {
+    path                = "/"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+# Listener on port 80
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.blue.arn
+  }
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "this" {
+  name = "${local.app_name}-cluster"
+}
+
+# ECS Task Definition (placeholder)
+resource "aws_ecs_task_definition" "strapi" {
+  family                   = "${local.app_name}-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode            = "awsvpc"
+  cpu                     = "512"
+  memory                  = "1024"
+  execution_role_arn      = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+  task_role_arn           = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+
+  container_definitions = jsonencode([
+    {
+      name      = "strapi"
+      image     = "607700977843.dkr.ecr.us-east-2.amazonaws.com/strapi-ecr-prod:latest"
+      portMappings = [
+        {
+          containerPort = 1337
+          hostPort      = 1337
+          protocol      = "tcp"
+        }
+      ]
+    }
+  ])
+}
+
+# ECS Service
+resource "aws_ecs_service" "strapi" {
+  name            = "${local.app_name}-svc"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.strapi.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  network_configuration {
+    subnets         = local.subnet_ids
+    security_groups = [aws_security_group.ecs_sg.id]
+    assign_public_ip = true
+  }
+
+  deployment_controller {
+    type = "CODE_DEPLOY"
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.blue.arn
+    container_name   = "strapi"
+    container_port   = 1337
+  }
+
+  depends_on = [aws_lb_listener.http]
+}
+
+# CodeDeploy Application
+resource "aws_codedeploy_app" "ecs_app" {
+  name = "${local.app_name}-cd-app"
+  compute_platform = "ECS"
+}
+
+# CodeDeploy Deployment Group
+resource "aws_codedeploy_deployment_group" "ecs_dg" {
+  app_name              = aws_codedeploy_app.ecs_app.name
+  deployment_group_name = "${local.app_name}-cd-dg"
+  service_role_arn      = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+
+  deployment_style {
+    deployment_type   = "BLUE_GREEN"
+    deployment_option = "WITH_TRAFFIC_CONTROL"
+  }
+
+  blue_green_deployment_config {
+    terminate_blue_instances_on_deployment_success {
+      action                           = "TERMINATE"
+      termination_wait_time_in_minutes = 5
+    }
+
+    deployment_ready_option {
+      action_on_timeout    = "CONTINUE_DEPLOYMENT"
+      wait_time_in_minutes = 0
+    }
+
+    green_fleet_provisioning_option {
+      action = "DISCOVER_EXISTING"
+    }
+  }
+
+  auto_rollback_configuration {
+    enabled = true
+    events  = ["DEPLOYMENT_FAILURE"]
+  }
+
+  ecs_service {
+    cluster_name = aws_ecs_cluster.this.name
+    service_name = aws_ecs_service.strapi.name
+  }
+
+  load_balancer_info {
+    target_group_pair_info {
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.http.arn]
+      }
+
+      target_group {
+        name = aws_lb_target_group.blue.name
+      }
+
+      target_group {
+        name = aws_lb_target_group.green.name
+      }
+    }
+  }
+
+  depends_on = [aws_ecs_service.strapi]
 }
