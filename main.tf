@@ -7,28 +7,28 @@ resource "random_id" "suffix" {
 }
 
 locals {
-  app_name     = "strapi-app-${random_id.suffix.hex}"
-  alb_name     = "alb-${random_id.suffix.hex}"
-  vpc_id       = data.aws_vpc.default.id
-  subnet_ids   = data.aws_subnets.default.ids
+  app_name = "strapi-app-${random_id.suffix.hex}"
 }
 
+# Get default VPC and Subnets
 data "aws_vpc" "default" {
   default = true
 }
 
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
+data "aws_subnet_ids" "all" {
+  vpc_id = data.aws_vpc.default.id
+}
+
+data "aws_subnet" "selected" {
+  count = 2 # Choose how many AZs/subnets you want ALB in (2 or 3 is fine)
+  id    = tolist(data.aws_subnet_ids.all.ids)[count.index]
 }
 
 # ALB Security Group
 resource "aws_security_group" "alb_sg" {
   name        = "alb-sg-${random_id.suffix.hex}"
   description = "Allow HTTP/HTTPS"
-  vpc_id      = local.vpc_id
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
     from_port   = 80
@@ -52,11 +52,11 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
-# ECS Security Group (allow from ALB only)
+# ECS Security Group
 resource "aws_security_group" "ecs_sg" {
   name        = "ecs-sg-${random_id.suffix.hex}"
   description = "Allow traffic from ALB on port 1337"
-  vpc_id      = local.vpc_id
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
     from_port       = 1337
@@ -75,20 +75,21 @@ resource "aws_security_group" "ecs_sg" {
 
 # ALB
 resource "aws_lb" "this" {
-  name               = local.alb_name
+  name               = "alb-${random_id.suffix.hex}"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = local.subnet_ids
+  subnets            = [for s in data.aws_subnet.selected : s.id]
 }
 
-# Target Groups: Blue & Green
+# Target Groups
 resource "aws_lb_target_group" "blue" {
-  name     = "tg-blue-${random_id.suffix.hex}"
-  port     = 1337
-  protocol = "HTTP"
-  vpc_id   = local.vpc_id
+  name        = "tg-blue-${random_id.suffix.hex}"
+  port        = 1337
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
   target_type = "ip"
+
   health_check {
     path                = "/"
     interval            = 30
@@ -99,11 +100,12 @@ resource "aws_lb_target_group" "blue" {
 }
 
 resource "aws_lb_target_group" "green" {
-  name     = "tg-green-${random_id.suffix.hex}"
-  port     = 1337
-  protocol = "HTTP"
-  vpc_id   = local.vpc_id
+  name        = "tg-green-${random_id.suffix.hex}"
+  port        = 1337
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
   target_type = "ip"
+
   health_check {
     path                = "/"
     interval            = 30
@@ -113,11 +115,12 @@ resource "aws_lb_target_group" "green" {
   }
 }
 
-# Listener on port 80
+# Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.this.arn
   port              = 80
   protocol          = "HTTP"
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.blue.arn
@@ -129,20 +132,20 @@ resource "aws_ecs_cluster" "this" {
   name = "${local.app_name}-cluster"
 }
 
-# ECS Task Definition (placeholder)
+# Task Definition
 resource "aws_ecs_task_definition" "strapi" {
   family                   = "${local.app_name}-task"
   requires_compatibilities = ["FARGATE"]
-  network_mode            = "awsvpc"
-  cpu                     = "512"
-  memory                  = "1024"
-  execution_role_arn      = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
-  task_role_arn           = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
+  task_role_arn            = "arn:aws:iam::607700977843:role/ecs-task-execution-role"
 
   container_definitions = jsonencode([
     {
-      name      = "strapi"
-      image     = "607700977843.dkr.ecr.us-east-2.amazonaws.com/strapi-ecr-prod:latest"
+      name  = "strapi"
+      image = "607700977843.dkr.ecr.us-east-2.amazonaws.com/strapi-ecr-prod:latest"
       portMappings = [
         {
           containerPort = 1337
@@ -154,7 +157,7 @@ resource "aws_ecs_task_definition" "strapi" {
   ])
 }
 
-# ECS Service
+# ECS Service with CODE_DEPLOY
 resource "aws_ecs_service" "strapi" {
   name            = "${local.app_name}-svc"
   cluster         = aws_ecs_cluster.this.id
@@ -163,7 +166,7 @@ resource "aws_ecs_service" "strapi" {
   desired_count   = 1
 
   network_configuration {
-    subnets         = local.subnet_ids
+    subnets         = [for s in data.aws_subnet.selected : s.id]
     security_groups = [aws_security_group.ecs_sg.id]
     assign_public_ip = true
   }
@@ -183,7 +186,7 @@ resource "aws_ecs_service" "strapi" {
 
 # CodeDeploy Application
 resource "aws_codedeploy_app" "ecs_app" {
-  name = "${local.app_name}-cd-app"
+  name             = "${local.app_name}-cd-app"
   compute_platform = "ECS"
 }
 
@@ -241,4 +244,8 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
   }
 
   depends_on = [aws_ecs_service.strapi]
+}
+
+output "alb_dns" {
+  value = aws_lb.this.dns_name
 }
