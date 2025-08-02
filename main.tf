@@ -1,60 +1,16 @@
+# --- main.tf ---
+
 provider "aws" {
   region = var.aws_region
 }
 
 resource "aws_ecs_cluster" "strapi" {
-  name = var.ecs_cluster_name
-}
-
-resource "aws_iam_role" "ecs_task_execution" {
-  name = "ecsTaskExecutionRole"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Principal = {
-        Service = "ecs-tasks.amazonaws.com"
-      }
-      Effect = "Allow"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_task_execution_attach" {
-  role       = aws_iam_role.ecs_task_execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
-
-resource "aws_ecs_task_definition" "strapi" {
-  family                   = "strapi-task"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
-  container_definitions = jsonencode([{
-    name      = "strapi"
-    image     = var.image_uri
-    essential = true
-    portMappings = [{
-      containerPort = 1337
-      protocol      = "tcp"
-    }]
-  }])
-}
-
-resource "aws_lb" "strapi" {
-  name               = "strapi-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = var.public_subnet_ids
+  name = "strapi-cluster"
 }
 
 resource "aws_security_group" "alb" {
   name        = "strapi-alb-sg"
-  description = "Allow HTTP/HTTPS"
+  description = "Allow HTTP and HTTPS"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -80,8 +36,9 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_security_group" "ecs" {
-  name   = "strapi-ecs-sg"
-  vpc_id = var.vpc_id
+  name        = "strapi-ecs-sg"
+  description = "Allow ALB access"
+  vpc_id      = var.vpc_id
 
   ingress {
     from_port       = 1337
@@ -98,40 +55,48 @@ resource "aws_security_group" "ecs" {
   }
 }
 
+resource "aws_lb" "strapi_alb" {
+  name               = "strapi-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = var.public_subnets
+}
+
 resource "aws_lb_target_group" "blue" {
-  name        = "strapi-blue-tg"
-  port        = 1337
-  protocol    = "HTTP"
+  name     = "strapi-blue"
+  port     = 1337
+  protocol = "HTTP"
+  vpc_id   = var.vpc_id
   target_type = "ip"
-  vpc_id      = var.vpc_id
   health_check {
     path                = "/"
-    matcher             = "200"
     interval            = 30
     timeout             = 5
     healthy_threshold   = 2
     unhealthy_threshold = 2
+    matcher             = "200"
   }
 }
 
 resource "aws_lb_target_group" "green" {
-  name        = "strapi-green-tg"
-  port        = 1337
-  protocol    = "HTTP"
+  name     = "strapi-green"
+  port     = 1337
+  protocol = "HTTP"
+  vpc_id   = var.vpc_id
   target_type = "ip"
-  vpc_id      = var.vpc_id
   health_check {
     path                = "/"
-    matcher             = "200"
     interval            = 30
     timeout             = 5
     healthy_threshold   = 2
     unhealthy_threshold = 2
+    matcher             = "200"
   }
 }
 
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.strapi.arn
+  load_balancer_arn = aws_lb.strapi_alb.arn
   port              = 80
   protocol          = "HTTP"
   default_action {
@@ -140,21 +105,89 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+resource "aws_ecs_task_definition" "strapi" {
+  family                   = "strapi-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = var.ecs_task_execution_role_arn
+  container_definitions    = jsonencode([
+    {
+      name      = "strapi"
+      image     = var.image_uri
+      essential = true
+      portMappings = [
+        {
+          containerPort = 1337
+          protocol      = "tcp"
+        }
+      ]
+    }
+  ])
+}
+
+resource "aws_codedeploy_app" "strapi" {
+  name = "strapi-codedeploy"
+  compute_platform = "ECS"
+}
+
+resource "aws_codedeploy_deployment_group" "strapi" {
+  app_name              = aws_codedeploy_app.strapi.name
+  deployment_group_name = "strapi-deploy-group"
+  service_role_arn       = var.codedeploy_role_arn
+
+  deployment_config_name = "CodeDeployDefault.ECSCanary10Percent5Minutes"
+  auto_rollback_configuration {
+    enabled = true
+    events  = ["DEPLOYMENT_FAILURE"]
+  }
+
+  deployment_style {
+    deployment_type = "BLUE_GREEN"
+    deployment_option = "WITH_TRAFFIC_CONTROL"
+  }
+
+  blue_green_deployment_config {
+    terminate_blue_instances_on_deployment_success {
+      action = "TERMINATE"
+      termination_wait_time_in_minutes = 5
+    }
+    deployment_ready_option {
+      action_on_timeout = "CONTINUE_DEPLOYMENT"
+    }
+  }
+
+  ecs_service {
+    cluster_name = aws_ecs_cluster.strapi.name
+    service_name = aws_ecs_service.strapi.name
+  }
+  load_balancer_info {
+    target_group_pair_info {
+      target_group {
+        name = aws_lb_target_group.blue.name
+      }
+      target_group {
+        name = aws_lb_target_group.green.name
+      }
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.http.arn]
+      }
+    }
+  }
+}
+
 resource "aws_ecs_service" "strapi" {
-  name            = var.ecs_service_name
+  name            = "strapi-service"
   cluster         = aws_ecs_cluster.strapi.id
   task_definition = aws_ecs_task_definition.strapi.arn
   desired_count   = 1
   launch_type     = "FARGATE"
-  platform_version = "LATEST"
-  network_configuration {
-    subnets         = var.public_subnet_ids
-    security_groups = [aws_security_group.ecs.id]
-    assign_public_ip = true
-  }
 
-  deployment_controller {
-    type = "CODE_DEPLOY"
+  network_configuration {
+    subnets         = var.private_subnets
+    assign_public_ip = false
+    security_groups  = [aws_security_group.ecs.id]
   }
 
   load_balancer {
@@ -165,54 +198,5 @@ resource "aws_ecs_service" "strapi" {
 
   lifecycle {
     ignore_changes = [task_definition]
-  }
-}
-
-resource "aws_codedeploy_app" "strapi" {
-  name = "StrapiApp"
-  compute_platform = "ECS"
-}
-
-resource "aws_codedeploy_deployment_group" "strapi" {
-  app_name              = aws_codedeploy_app.strapi.name
-  deployment_group_name = "StrapiDeploymentGroup"
-  service_role_arn      = var.codedeploy_role_arn
-
-  deployment_config_name = "CodeDeployDefault.ECSCanary10Percent5Minutes"
-  auto_rollback_configuration {
-    enabled = true
-    events  = ["DEPLOYMENT_FAILURE"]
-  }
-
-  blue_green_deployment_config {
-    terminate_blue_instances_on_deployment_success {
-      action = "TERMINATE"
-      termination_wait_time_in_minutes = 5
-    }
-
-    deployment_ready_option {
-      action_on_timeout = "CONTINUE_DEPLOYMENT"
-    }
-  }
-
-  ecs_service {
-    cluster_name = aws_ecs_cluster.strapi.name
-    service_name = aws_ecs_service.strapi.name
-  }
-
-  load_balancer_info {
-    target_group_pair_info {
-      target_group {
-        name = aws_lb_target_group.blue.name
-      }
-
-      target_group {
-        name = aws_lb_target_group.green.name
-      }
-
-      prod_traffic_route {
-        listener_arns = [aws_lb_listener.http.arn]
-      }
-    }
   }
 }
