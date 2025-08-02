@@ -1,6 +1,11 @@
+# Generate random suffix
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
 # ECS Cluster
 resource "aws_ecs_cluster" "strapi" {
-  name = "${var.app_name}-cluster"
+  name = "${var.app_name}-${random_id.suffix.hex}-cluster"
 }
 
 # Get default VPC and subnets
@@ -17,7 +22,7 @@ data "aws_subnets" "default" {
 
 # Security Group for ALB
 resource "aws_security_group" "alb_sg" {
-  name        = "${var.app_name}-alb-sg"
+  name        = "${var.app_name}-${random_id.suffix.hex}-alb-sg"
   description = "Allow HTTP/HTTPS to ALB"
   vpc_id      = data.aws_vpc.default.id
 
@@ -45,7 +50,7 @@ resource "aws_security_group" "alb_sg" {
 
 # Security Group for ECS Tasks
 resource "aws_security_group" "ecs_sg" {
-  name        = "${var.app_name}-ecs-sg"
+  name        = "${var.app_name}-${random_id.suffix.hex}-ecs-sg"
   description = "Allow ALB to ECS on container port"
   vpc_id      = data.aws_vpc.default.id
 
@@ -66,7 +71,7 @@ resource "aws_security_group" "ecs_sg" {
 
 # Application Load Balancer
 resource "aws_lb" "this" {
-  name               = "${var.app_name}-alb"
+  name               = "${var.app_name}-${random_id.suffix.hex}-alb"
   load_balancer_type = "application"
   subnets            = data.aws_subnets.default.ids
   security_groups    = [aws_security_group.alb_sg.id]
@@ -74,7 +79,7 @@ resource "aws_lb" "this" {
 
 # Target Groups
 resource "aws_lb_target_group" "blue" {
-  name        = "${var.app_name}-blue-tg"
+  name        = "${var.app_name}-${random_id.suffix.hex}-blue-tg"
   port        = var.container_port
   protocol    = "HTTP"
   target_type = "ip"
@@ -90,7 +95,7 @@ resource "aws_lb_target_group" "blue" {
 }
 
 resource "aws_lb_target_group" "green" {
-  name        = "${var.app_name}-green-tg"
+  name        = "${var.app_name}-${random_id.suffix.hex}-green-tg"
   port        = var.container_port
   protocol    = "HTTP"
   target_type = "ip"
@@ -118,7 +123,7 @@ resource "aws_lb_listener" "http" {
 
 # IAM Roles
 resource "aws_iam_role" "ecs_task_execution" {
-  name = "${var.app_name}-ecs-exec-role"
+  name = "${var.app_name}-${random_id.suffix.hex}-ecs-exec-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -139,7 +144,7 @@ resource "aws_iam_role_policy_attachment" "ecs_exec_role_attach" {
 
 # Task Definition
 resource "aws_ecs_task_definition" "strapi_task" {
-  family                   = "${var.app_name}-task"
+  family                   = "${var.app_name}-${random_id.suffix.hex}-task"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = "512"
@@ -163,7 +168,7 @@ resource "aws_ecs_task_definition" "strapi_task" {
 
 # ECS Service
 resource "aws_ecs_service" "strapi" {
-  name            = "${var.app_name}-svc"
+  name            = "${var.app_name}-${random_id.suffix.hex}-svc"
   cluster         = aws_ecs_cluster.strapi.id
   launch_type     = "FARGATE"
   desired_count   = 1
@@ -190,11 +195,11 @@ resource "aws_ecs_service" "strapi" {
 
 # IAM Role for CodeDeploy
 resource "aws_iam_role" "codedeploy_role" {
-  name = "${var.app_name}-codedeploy-role"
+  name = "${var.app_name}-${random_id.suffix.hex}-codedeploy-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
+    Statement = [ {
       Effect = "Allow"
       Principal = {
         Service = "codedeploy.amazonaws.com"
@@ -211,13 +216,13 @@ resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
 
 # CodeDeploy App and Deployment Group
 resource "aws_codedeploy_app" "ecs" {
-  name             = "${var.app_name}-codedeploy-app"
+  name             = "${var.app_name}-${random_id.suffix.hex}-cd-app"
   compute_platform = "ECS"
 }
 
 resource "aws_codedeploy_deployment_group" "ecs" {
   app_name               = aws_codedeploy_app.ecs.name
-  deployment_group_name  = "${var.app_name}-deploy-group"
+  deployment_group_name  = "${var.app_name}-${random_id.suffix.hex}-deploy-group"
   service_role_arn       = aws_iam_role.codedeploy_role.arn
   deployment_config_name = "CodeDeployDefault.ECSCanary10Percent5Minutes"
 
