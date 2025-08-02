@@ -13,7 +13,3 @@ variable "image_url" {
   description = "Docker image URL for the ECS task definition"
   type        = string
 }
-variable "image_url" {
-  description = "Docker image URL for the ECS task definition"
-  type        = string
-}
