@@ -43,7 +43,7 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
-# Security Group for ECS Service
+# Security Group for ECS Tasks
 resource "aws_security_group" "ecs_sg" {
   name        = "${var.app_name}-ecs-sg"
   description = "Allow ALB to ECS on container port"
@@ -72,7 +72,7 @@ resource "aws_lb" "this" {
   security_groups    = [aws_security_group.alb_sg.id]
 }
 
-# Blue Target Group
+# Target Groups
 resource "aws_lb_target_group" "blue" {
   name        = "${var.app_name}-blue-tg"
   port        = var.container_port
@@ -89,7 +89,6 @@ resource "aws_lb_target_group" "blue" {
   }
 }
 
-# Green Target Group
 resource "aws_lb_target_group" "green" {
   name        = "${var.app_name}-green-tg"
   port        = var.container_port
@@ -106,7 +105,7 @@ resource "aws_lb_target_group" "green" {
   }
 }
 
-# ALB Listener (HTTP)
+# Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.this.arn
   port              = 80
@@ -117,52 +116,7 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# ECS Task Definition
-resource "aws_ecs_task_definition" "strapi_task" {
-  family                   = "${var.app_name}-task"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
-
-  container_definitions = jsonencode([{
-    name      = "strapi"
-    image     = "607700977843.dkr.ecr.us-east-2.amazonaws.com/strapi-ecr-prod:latest"
-    essential = true
-    portMappings = [{
-      containerPort = var.container_port
-      protocol      = "tcp"
-    }]
-  }])
-}
-
-# ECS Service using CodeDeploy
-resource "aws_ecs_service" "strapi" {
-  name            = "${var.app_name}-svc"
-  cluster         = aws_ecs_cluster.strapi.id
-  launch_type     = "FARGATE"
-  task_definition = aws_ecs_task_definition.strapi_task.arn
-  desired_count   = 1
-
-  deployment_controller {
-    type = "CODE_DEPLOY"
-  }
-
-  network_configuration {
-    subnets         = data.aws_subnets.default.ids
-    assign_public_ip = true
-    security_groups = [aws_security_group.ecs_sg.id]
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.blue.arn
-    container_name   = "strapi"
-    container_port   = var.container_port
-  }
-}
-
-# IAM Role for ECS Task Execution
+# IAM Roles
 resource "aws_iam_role" "ecs_task_execution" {
   name = "${var.app_name}-ecs-exec-role"
 
@@ -181,6 +135,57 @@ resource "aws_iam_role" "ecs_task_execution" {
 resource "aws_iam_role_policy_attachment" "ecs_exec_role_attach" {
   role       = aws_iam_role.ecs_task_execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Task Definition
+resource "aws_ecs_task_definition" "strapi_task" {
+  family                   = "${var.app_name}-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "strapi"
+      image     = var.image_url
+      essential = true
+      portMappings = [
+        {
+          containerPort = var.container_port
+          protocol      = "tcp"
+        }
+      ]
+    }
+  ])
+}
+
+# ECS Service
+resource "aws_ecs_service" "strapi" {
+  name            = "${var.app_name}-svc"
+  cluster         = aws_ecs_cluster.strapi.id
+  launch_type     = "FARGATE"
+  desired_count   = 1
+  deployment_controller {
+    type = "CODE_DEPLOY"
+  }
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    assign_public_ip = true
+    security_groups  = [aws_security_group.ecs_sg.id]
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.blue.arn
+    container_name   = "strapi"
+    container_port   = var.container_port
+  }
+
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
 }
 
 # IAM Role for CodeDeploy
@@ -204,34 +209,17 @@ resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
   policy_arn = "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
 }
 
-# CodeDeploy Application
+# CodeDeploy App and Deployment Group
 resource "aws_codedeploy_app" "ecs" {
   name             = "${var.app_name}-codedeploy-app"
   compute_platform = "ECS"
 }
 
-# CodeDeploy Deployment Group
 resource "aws_codedeploy_deployment_group" "ecs" {
   app_name               = aws_codedeploy_app.ecs.name
   deployment_group_name  = "${var.app_name}-deploy-group"
   service_role_arn       = aws_iam_role.codedeploy_role.arn
   deployment_config_name = "CodeDeployDefault.ECSCanary10Percent5Minutes"
-
-  auto_rollback_configuration {
-    enabled = true
-    events  = ["DEPLOYMENT_FAILURE"]
-  }
-
-  blue_green_deployment_config {
-    terminate_blue_instances_on_deployment_success {
-      action = "TERMINATE"
-      termination_wait_time_in_minutes = 5
-    }
-
-    deployment_ready_option {
-      action_on_timeout = "CONTINUE_DEPLOYMENT"
-    }
-  }
 
   ecs_service {
     cluster_name = aws_ecs_cluster.strapi.name
@@ -252,5 +240,21 @@ resource "aws_codedeploy_deployment_group" "ecs" {
         name = aws_lb_target_group.green.name
       }
     }
+  }
+
+  blue_green_deployment_config {
+    terminate_blue_instances_on_deployment_success {
+      action                              = "TERMINATE"
+      termination_wait_time_in_minutes   = 5
+    }
+
+    deployment_ready_option {
+      action_on_timeout = "CONTINUE_DEPLOYMENT"
+    }
+  }
+
+  auto_rollback_configuration {
+    enabled = true
+    events  = ["DEPLOYMENT_FAILURE"]
   }
 }
