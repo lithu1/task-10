@@ -10,18 +10,22 @@ locals {
   app_name = "strapi-app-${random_id.suffix.hex}"
 }
 
-# Get default VPC and Subnets
+# Default VPC and Subnets
 data "aws_vpc" "default" {
   default = true
 }
 
-data "aws_subnet_ids" "all" {
-  vpc_id = data.aws_vpc.default.id
+data "aws_subnets" "all" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
 }
 
+# Select one subnet per AZ (up to 2 here)
 data "aws_subnet" "selected" {
-  count = 2 # Choose how many AZs/subnets you want ALB in (2 or 3 is fine)
-  id    = tolist(data.aws_subnet_ids.all.ids)[count.index]
+  count = 2
+  id    = tolist(data.aws_subnets.all.ids)[count.index]
 }
 
 # ALB Security Group
@@ -55,7 +59,7 @@ resource "aws_security_group" "alb_sg" {
 # ECS Security Group
 resource "aws_security_group" "ecs_sg" {
   name        = "ecs-sg-${random_id.suffix.hex}"
-  description = "Allow traffic from ALB on port 1337"
+  description = "Allow ALB to reach ECS on port 1337"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -73,7 +77,7 @@ resource "aws_security_group" "ecs_sg" {
   }
 }
 
-# ALB
+# Load Balancer
 resource "aws_lb" "this" {
   name               = "alb-${random_id.suffix.hex}"
   internal           = false
@@ -82,7 +86,7 @@ resource "aws_lb" "this" {
   subnets            = [for s in data.aws_subnet.selected : s.id]
 }
 
-# Target Groups
+# Target Groups: Blue & Green
 resource "aws_lb_target_group" "blue" {
   name        = "tg-blue-${random_id.suffix.hex}"
   port        = 1337
@@ -132,7 +136,7 @@ resource "aws_ecs_cluster" "this" {
   name = "${local.app_name}-cluster"
 }
 
-# Task Definition
+# Task Definition (placeholder)
 resource "aws_ecs_task_definition" "strapi" {
   family                   = "${local.app_name}-task"
   requires_compatibilities = ["FARGATE"]
@@ -157,7 +161,7 @@ resource "aws_ecs_task_definition" "strapi" {
   ])
 }
 
-# ECS Service with CODE_DEPLOY
+# ECS Service with CodeDeploy controller
 resource "aws_ecs_service" "strapi" {
   name            = "${local.app_name}-svc"
   cluster         = aws_ecs_cluster.this.id
@@ -246,6 +250,3 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
   depends_on = [aws_ecs_service.strapi]
 }
 
-output "alb_dns" {
-  value = aws_lb.this.dns_name
-}
