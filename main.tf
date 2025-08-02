@@ -12,16 +12,13 @@ provider "aws" {
   region = "us-east-2"
 }
 
-resource "random_id" "suffix" {
-  byte_length = 4
+variable "ecs_service_name" {
+  description = "Name of the ECS service to register with CodeDeploy"
+  type        = string
 }
 
-locals {
-  name       = "strapi-app-${random_id.suffix.hex}"
-  vpc_id     = data.aws_vpc.default.id
-  subnet_ids = data.aws_subnets.default.ids
-  blue_tg    = aws_lb_target_group.blue.arn
-  green_tg   = aws_lb_target_group.green.arn
+resource "random_id" "suffix" {
+  byte_length = 4
 }
 
 data "aws_vpc" "default" {
@@ -35,6 +32,13 @@ data "aws_subnets" "default" {
   }
 }
 
+locals {
+  name       = "strapi-app-${random_id.suffix.hex}"
+  vpc_id     = data.aws_vpc.default.id
+  subnet_ids = data.aws_subnets.default.ids
+}
+
+# Security Group for ALB
 resource "aws_security_group" "alb_sg" {
   name_prefix = "alb-sg-"
   vpc_id      = local.vpc_id
@@ -54,6 +58,7 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
+# Security Group for ECS
 resource "aws_security_group" "ecs_sg" {
   name_prefix = "ecs-sg-"
   vpc_id      = local.vpc_id
@@ -73,26 +78,29 @@ resource "aws_security_group" "ecs_sg" {
   }
 }
 
+# Application Load Balancer
 resource "aws_lb" "this" {
   name               = "alb-${random_id.suffix.hex}"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
-
-  subnets = distinct(local.subnet_ids)
+  subnets            = local.subnet_ids
 
   enable_deletion_protection = false
+
   tags = {
     Name = local.name
   }
 }
 
+# Target Groups
 resource "aws_lb_target_group" "blue" {
   name        = "blue-tg-${random_id.suffix.hex}"
   port        = 1337
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = local.vpc_id
+
   health_check {
     path                = "/"
     interval            = 30
@@ -109,6 +117,7 @@ resource "aws_lb_target_group" "green" {
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = local.vpc_id
+
   health_check {
     path                = "/"
     interval            = 30
@@ -119,31 +128,33 @@ resource "aws_lb_target_group" "green" {
   }
 }
 
+# Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.this.arn
   port              = 80
   protocol          = "HTTP"
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.blue.arn
   }
 }
 
+# ECS Cluster
 resource "aws_ecs_cluster" "this" {
   name = "strapi-cluster-${random_id.suffix.hex}"
 }
 
+# IAM Role for CodeDeploy
 resource "aws_iam_role" "codedeploy_role" {
   name = "codedeploy-role-${random_id.suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Action = "sts:AssumeRole",
-      Effect = "Allow",
-      Principal = {
-        Service = "codedeploy.amazonaws.com"
-      }
+      Effect    = "Allow",
+      Principal = { Service = "codedeploy.amazonaws.com" },
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -153,11 +164,13 @@ resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
   policy_arn = "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
 }
 
+# CodeDeploy App
 resource "aws_codedeploy_app" "ecs" {
   name             = "${local.name}-cd"
   compute_platform = "ECS"
 }
 
+# CodeDeploy Deployment Group
 resource "aws_codedeploy_deployment_group" "ecs_dg" {
   app_name               = aws_codedeploy_app.ecs.name
   deployment_group_name  = "${local.name}-cd-dg"
@@ -173,8 +186,9 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
     deployment_ready_option {
       action_on_timeout = "CONTINUE_DEPLOYMENT"
     }
+
     terminate_blue_instances_on_deployment_success {
-      action = "TERMINATE"
+      action                         = "TERMINATE"
       termination_wait_time_in_minutes = 5
     }
   }
@@ -186,7 +200,7 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
 
   ecs_service {
     cluster_name = aws_ecs_cluster.this.name
-    service_name = "PLACEHOLDER-ECS-SERVICE-NAME"
+    service_name = var.ecs_service_name
   }
 
   load_balancer_info {
@@ -194,9 +208,11 @@ resource "aws_codedeploy_deployment_group" "ecs_dg" {
       prod_traffic_route {
         listener_arns = [aws_lb_listener.http.arn]
       }
+
       target_group {
         name = aws_lb_target_group.blue.name
       }
+
       target_group {
         name = aws_lb_target_group.green.name
       }
